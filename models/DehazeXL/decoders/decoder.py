@@ -1,10 +1,13 @@
 import torch
 import torch.hub
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
 from ..backbones import *
 from ..context_encoders import ContextEncoderConfig
+from ..modules.adapter import make_stage_adapters
+from ..modules.global_descriptor import MultiScaleGlobalDescriptor
 from .utils import LlamaRMSNorm, get_2d_sincos_pos_embed
 
 # default_decoder_filters = [48, 96, 176, 256]
@@ -321,12 +324,14 @@ class DehazeXL(AbstractModel):
             channels_last: bool = True,
             crop_size: int = 256,
             mlp_ratio: int = 4,
+            global_dim: int = 1024,
     ):
         self.channels_last = channels_last
         self.crop_size = crop_size
         self.filters = [f["num_chs"] for f in backbone.feature_info]
         self.mlp_ratio = mlp_ratio
         self.xl_config = xl_config
+        self.global_dim = global_dim
 
         super().__init__()
 
@@ -342,45 +347,107 @@ class DehazeXL(AbstractModel):
             attention_method=self.xl_config.attention_method,
         )
         self.decoder = SwinDecoder(in_resolution=crop_size // 4)
+        self.descriptor = MultiScaleGlobalDescriptor(self.filters, hidden_dim=self.global_dim)
+        self.global_aux_head = nn.Sequential(
+            nn.LayerNorm(self.global_dim),
+            nn.Linear(self.global_dim, self.filters[-1]),
+        )
 
-    def forward(self, x):
-        # Encoder
+        # Task adapters per encoder stage (added on demand via register_adapter)
+        self.task_adapters = nn.ModuleDict()
+        self.active_task = None
+
+    def register_adapter(self, task: str, r: float = 1 / 16):
+        """Create and register adapters for a task across encoder stages.
+
+        task: e.g., 'dehaze', 'derain'
+        r: reduction ratio for adapters
+        """
+        if task in self.task_adapters:
+            return
+        adapters = make_stage_adapters(self.filters, r=r)
+        self.task_adapters[task] = adapters
+
+    def set_active_task(self, task: str | None):
+        self.active_task = task
+
+    def forward(
+            self,
+            x,
+            return_global: bool = False,
+            adapter_task: str | None = None,
+            return_aux: bool = False,
+    ):
+        features, skip, n_regions = self.encode(x)
+        task = adapter_task if adapter_task is not None else self.active_task
+        need_global = return_global or return_aux
+        aux_target = None
+        if return_aux:
+            aux_target = F.adaptive_avg_pool2d(features[-1], 1).flatten(1).detach()
+        global_vec = self.get_global_descriptor(features) if need_global else None
+        output = self.decode_from_features(features, skip, n_regions, task=task)
+        if return_aux:
+            aux_pred = self.global_aux_projection(global_vec)
+            return output, global_vec, aux_pred, aux_target
+        if return_global:
+            return output, global_vec
+        return output
+
+    def encode(self, x):
         if self.channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
-        x_skip = x
-        n_regions = x.shape[2] // self.crop_size
+        skip = x
+        raw_tiles = x.shape[2] // self.crop_size
+        n_regions = max(1, raw_tiles)
 
-        if n_regions > 1:
-            x = self.nested_tokenization(x)
-
-            n = x.shape[0]
+        if raw_tiles > 1:
+            tokenized = self.nested_tokenization(x)
+            n_tokens = tokenized.shape[0]
             outputs = []
-            for i in range(0, n, self.batch_size):
-                batch = x[i:min(i + self.batch_size, n)]
+            for i in range(0, n_tokens, self.batch_size):
+                batch = tokenized[i:min(i + self.batch_size, n_tokens)]
                 output = self.encoder(batch)
                 outputs.append(output)
             enc_results = [torch.cat([outputs[j][i] for j in range(len(outputs))], dim=0) for i in range(4)]
-
-            # enc_results = self.encoder(x)
-
-            enc_results = list(
-                [
-                    rearrange(
-                        i,
-                        "(N HP WP) C HC WC -> N C (HP HC) (WP WC)",
-                        HP=n_regions,
-                        WP=n_regions,
-                    )
-                    for i in enc_results
-                ]
-            )
+            enc_results = [
+                rearrange(
+                    feat,
+                    "(N HP WP) C HC WC -> N C (HP HC) (WP WC)",
+                    HP=n_regions,
+                    WP=n_regions,
+                )
+                for feat in enc_results
+            ]
         else:
             enc_results = self.encoder(x)
 
-        output = self.bottleneck(enc_results)
-        output = self.decoder(output, enc_results, n_regions)
-        output += x_skip
-        return output
+        if isinstance(enc_results, tuple):
+            enc_results = list(enc_results)
+        return enc_results, skip, n_regions
+
+    def get_global_descriptor(self, features):
+        return self.descriptor(features)
+
+    def global_aux_projection(self, descriptor):
+        return self.global_aux_head(descriptor)
+
+    def _apply_adapters(self, features, task: str | None):
+        if task is None or task not in self.task_adapters:
+            return list(features)
+        adapters = self.task_adapters[task]
+        adapted = []
+        for idx, feat in enumerate(features):
+            if idx < len(adapters):
+                adapted.append(adapters[idx](feat))
+            else:
+                adapted.append(feat)
+        return adapted
+
+    def decode_from_features(self, features, skip, n_regions, task: str | None = None):
+        adapted = self._apply_adapters(features, task)
+        bottleneck_out = self.bottleneck(adapted)
+        decoded = self.decoder(bottleneck_out, adapted, n_regions)
+        return decoded + skip
 
     def nested_tokenization(self, x):
         n_regions = x.shape[2] // self.crop_size

@@ -8,6 +8,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from models.DehazeXL.decoders.decoder import DehazeXL
+from infer.sliding_window import sliding_window_infer
 
 
 def unnormalize(tensor, mean, std):
@@ -22,6 +23,10 @@ def main(args):
     print(f'Using device: {device}')
 
     model = DehazeXL().to(device)
+    # Register adapters and select task for validation
+    model.register_adapter('dehaze')
+    model.register_adapter('derain')
+    model.set_active_task(args.task)
 
     if os.path.isfile(args.model_path):
         model_path = [args.model_path]
@@ -86,7 +91,10 @@ def main(args):
                 input_tensor = transform(cloud_img).unsqueeze(0).to(device)
                 if args.fp16:
                     input_tensor = input_tensor.half()
-                out = model(input_tensor)
+                if args.tile > 0:
+                    out = sliding_window_infer(model, input_tensor, tile=args.tile, overlap=args.overlap, blend=args.blend)
+                else:
+                    out = model(input_tensor)
                 if args.nor:
                     out = unnormalize(out,
                                       [0.48694769, 0.53490934, 0.45040282],
@@ -118,4 +126,9 @@ if __name__ == '__main__':
                         help='Normalize input image')
     parser.add_argument('--fp16', action='store_true',
                         help='Loading models and data in FP16 format')
+    parser.add_argument('--task', type=str, choices=['dehaze', 'derain'], default='dehaze',
+                        help='Select which expert adapter to use for validation')
+    parser.add_argument('--tile', type=int, default=0, help='Sliding window tile size (0 to disable)')
+    parser.add_argument('--overlap', type=int, default=64, help='Sliding window overlap in pixels')
+    parser.add_argument('--blend', type=str, choices=['hann', 'none'], default='hann', help='Blending window for tiles')
     main(parser.parse_args())

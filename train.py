@@ -88,7 +88,7 @@ def train_model(model, train_dataloader, test_dataloader, optimizer, criterion, 
             if step % int(args.save_cycle * len(train_dataloader)) == 0:
                 torch.save(model.state_dict(), os.path.join(args.save_dir, '{}.pth'.format(step)))
         print('Epoch:{}/{} | Loss:{:.4f}'.format(epoch + 1, args.epochs, np.mean(losses['loss'])))
-        test_loss = evaluate(model, test_dataloader, criterion, device)
+        test_loss = evaluate(model, test_dataloader, criterion, device,vgg)
         if test_loss <= best_loss:
             torch.save(model.state_dict(), os.path.join(args.save_dir, 'best.pth'))
             best_loss = test_loss
@@ -138,7 +138,7 @@ def main(args):
         model = torch.nn.DataParallel(model)
     criterion = nn.L1Loss().to(device)
     # 初始化VGG16感知网络
-    vgg = vgg16(pretrained=True).features[:16].eval().to(device)
+    vgg = vgg16(weights=True).features[:16].eval().to(device)
     for param in vgg.parameters():
         param.requires_grad = False
     optimizer = torch.optim.AdamW(params=filter(lambda x: x.requires_grad, model.parameters()),
@@ -171,7 +171,7 @@ if __name__ == '__main__':
                         help='Normalize the image')
     parser.add_argument('--dataset', type=str, choices=['8k', 'rain'], default='8k',
                         help='Dataset type to use')
-    parser.add_argument('--crop_size', type=int, default=4096,
+    parser.add_argument('--crop_size', type=int, default=512,
                         help='Crop size of patches (set 0 to disable)')
     parser.add_argument('--grad_clip', type=float, default=0.0,
                         help='Clip gradient norm to this value (0 to disable)')

@@ -78,8 +78,8 @@ class RainRemovalDataset(Dataset):
     """Dataset loader for paired clear/addrain rain removal dataset."""
     def __init__(self, root_dir, normalize, crop_size):
         self.root_dir = root_dir
-        self.clear_dir = os.path.join(self.root_dir, 'clear')
-        self.rain_dir = os.path.join(self.root_dir, 'addrain')
+        self.clear_dir = os.path.join(self.root_dir, 'gt')
+        self.rain_dir = os.path.join(self.root_dir, 'input')
         self.image_filenames = [
             img for img in os.listdir(self.clear_dir)
             if img.lower().endswith('.png') or img.lower().endswith('.jpg')

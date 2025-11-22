@@ -101,7 +101,7 @@ def cal_loss(res, clear_img, criterion, vgg=None):
     return loss
 
 
-def train_model(model, train_dataloader, test_dataloader, optimizer, criterion, device, scheduler, args, vgg):
+def train_model(model, train_dataloader, test_dataloader, optimizer, criterion, device, scheduler, args, vgg, log_path):
     if args.resume is not None:
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f'Checkpoint {args.resume} not found.')
@@ -228,11 +228,13 @@ def main(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader),
                                                            eta_min=1e-6)
     optimizer.zero_grad()
-    train_model(model, train_loader, test_loader, optimizer, criterion, device, scheduler, args, vgg)
-
     log_path = os.path.join(args.save_dir, "log.txt")
     os.makedirs(args.save_dir, exist_ok=True)
     log_to_file(log_path, f"Start training with args: {args}")
+
+    train_model(model, train_loader, test_loader, optimizer, criterion, device, scheduler, args, vgg, log_path)
+
+    
 
 
 if __name__ == '__main__':
